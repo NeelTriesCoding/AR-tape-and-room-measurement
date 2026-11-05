@@ -59,15 +59,50 @@ export function verticalHeight(base, origin, dir) {
   return t;
 }
 
-// Snap a new point relative to the previous one: plumb (vertical) within 7°, level within 4°.
+// Snap a new point relative to the previous one: plumb (vertical) within 5°, level within 3°.
 export function snapPoint(prev, p) {
   const v = sub(p, prev);
   const L = len(v);
   if (L < 0.02) return { p, kind: null };
   const horiz = Math.hypot(v[0], v[2]);
-  if (horiz < L * Math.sin(7 / DEG)) return { p: [prev[0], p[1], prev[2]], kind: 'plumb' };
-  if (Math.abs(v[1]) < L * Math.sin(4 / DEG)) return { p: [p[0], prev[1], p[2]], kind: 'level' };
+  if (horiz < L * Math.sin(5 / DEG)) return { p: [prev[0], p[1], prev[2]], kind: 'plumb' };
+  if (Math.abs(v[1]) < L * Math.sin(3 / DEG)) return { p: [p[0], prev[1], p[2]], kind: 'level' };
   return { p, kind: null };
+}
+
+// Angle of a segment above or below horizontal, in degrees.
+export function inclination(a, b) {
+  const v = sub(b, a);
+  const L = len(v);
+  return L ? Math.asin(Math.min(1, Math.abs(v[1]) / L)) * DEG : 0;
+}
+
+// Where a ray meets an infinite plane (point p0, normal n). Null if parallel, behind, or absurdly far.
+export function rayPlane(o, d, p0, n, maxT = 15) {
+  const den = dot(d, n);
+  if (Math.abs(den) < 1e-4) return null;
+  const t = dot(sub(p0, o), n) / den;
+  if (t <= 0.05 || t > maxT) return null;
+  return add(o, scale(d, t));
+}
+
+export const distToPlane = (p, p0, n) => Math.abs(dot(sub(p, p0), n));
+
+// World point seen at normalised view coords (x, y in 0..1, top-left origin) at view-space depth d.
+// proj is the view's projection matrix, worldFromView its transform matrix (both column-major).
+export function unproject(proj, worldFromView, x, y, d) {
+  const nx = x * 2 - 1, ny = 1 - y * 2;
+  const X = d * (nx + proj[8]) / proj[0];
+  const Y = d * (ny + proj[9]) / proj[5];
+  const w = mulMat4(worldFromView, [X, Y, -d, 1]);
+  return [w[0], w[1], w[2]];
+}
+
+// Spread of recent samples: largest distance from their mean, in metres.
+export function spread(list) {
+  if (list.length < 2) return 0;
+  const c = centroid(list);
+  return Math.max(...list.map(p => dist(p, c)));
 }
 
 export function rotateByQuat(v, q) {

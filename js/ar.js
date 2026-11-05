@@ -1,8 +1,9 @@
 // Camera measuring with WebXR (Chrome on Android uses ARCore underneath).
 // The camera feed is composited by the browser; we draw lines and labels on a 2D canvas inside the DOM overlay.
 import {
-  sub, add, scale, dist, norm, cross, mid, pathLength, polygon, centroid, angleAt,
+  sub, add, scale, dist, dot, norm, cross, pathLength, polygon, centroid, angleAt,
   verticalHeight, snapPoint, rotateByQuat, mulMat4,
+  inclination, rayPlane, distToPlane, unproject, spread,
 } from './geometry.js';
 import {
   settings, saveSettings, setUnits, onUnitsChange,
@@ -29,6 +30,14 @@ const snapped = s => {
 };
 const kindTag = k => (k === 'level' ? ' · level' : k === 'plumb' ? ' · plumb' : '');
 const noSurface = 'Point at the floor or a table and move the phone slowly';
+// "12.4° from level" for sloped lines; nothing when snapped or nearly flat/upright.
+const slopeTag = (a, b, kind) => {
+  if (kind || dist(a, b) < 0.05) return '';
+  const deg = inclination(a, b);
+  if (deg < 0.5) return ' · level';
+  if (deg > 89.5) return ' · plumb';
+  return ` · ${deg.toFixed(1)}° from level`;
+};
 
 export const AR_MODES = {
   tape: {
@@ -40,10 +49,10 @@ export const AR_MODES = {
     },
     readout(s) {
       const c = s.cursor;
-      if (s.pts.length && c) { const L = dist(s.pts[0], c.p); return { value: fmtLen(L), sub: fmtLenAlt(L) + kindTag(c.kind), hint: 'Aim at the other end, tap +' }; }
+      if (s.pts.length && c) { const L = dist(s.pts[0], c.p); return { value: fmtLen(L), sub: fmtLenAlt(L) + (kindTag(c.kind) || slopeTag(s.pts[0], c.p)), hint: 'Aim at the other end, tap +' }; }
       const last = s.done[s.done.length - 1];
       const hint = c ? 'Aim at one end, tap +' : noSurface;
-      if (last) { const L = dist(last.a, last.b); return { value: fmtLen(L), sub: fmtLenAlt(L), hint }; }
+      if (last) { const L = dist(last.a, last.b); return { value: fmtLen(L), sub: fmtLenAlt(L) + (kindTag(last.kind) || slopeTag(last.a, last.b)), hint }; }
       return { value: '--', sub: '', hint };
     },
     prims(s) {
@@ -55,7 +64,7 @@ export const AR_MODES = {
       return out;
     },
     summary(items) {
-      const lines = items.map((d, i) => `Line ${i + 1}: ${fmtLen(dist(d.a, d.b))} (${fmtLenAlt(dist(d.a, d.b))})${kindTag(d.kind)}`);
+      const lines = items.map((d, i) => `Line ${i + 1}: ${fmtLen(dist(d.a, d.b))} (${fmtLenAlt(dist(d.a, d.b))})${kindTag(d.kind) || slopeTag(d.a, d.b)}`);
       const value = items.length === 1 ? fmtLen(dist(items[0].a, items[0].b)) : `${items.length} lines`;
       return { title: 'Tape', value, lines, data: { segments: items.map(d => [d.a, d.b]) } };
     },
@@ -306,6 +315,12 @@ function wireUI() {
   $('#ar-close').addEventListener('click', () => S?.session.end());
   $('#ar-units').addEventListener('click', () => setUnits(settings.units === 'metric' ? 'imperial' : 'metric'));
   $('#ar-snap').addEventListener('click', () => { settings.snap = !settings.snap; saveSettings(); refresh(); });
+  $('#ar-lock').addEventListener('click', () => {
+    if (!S) return;
+    S.lock = !S.lock;
+    toast(S.lock ? 'Points stay on the first surface you tap' : 'Points follow whatever you aim at');
+    refresh();
+  });
   onUnitsChange(() => refresh());
 }
 
@@ -316,7 +331,11 @@ function doAdd() {
   if (!S) return;
   const c = S.cursor;
   if (!c) { toast('No surface yet. Move the phone slowly.'); return; }
+  const starting = S.pts.length === 0;
+  // The first point of each shape fixes the surface plane used for locking and grazing-angle fallback.
+  if (starting && S.hit && !c.free) S.plane = { p: c.p.slice(), n: S.hitNormal.slice() };
   mode().add(S, c);
+  if (!c.close) S.pendingAnchors.push(c.p);
   buzz();
   refresh();
 }
@@ -327,10 +346,15 @@ function refresh() {
   const r = m.readout(S);
   $('#ar-value').textContent = r.value;
   $('#ar-sub').textContent = r.sub;
-  $('#ar-hint').textContent = S.tracking ? r.hint : 'Tracking lost. Move slowly, more light helps.';
+  let hint = r.hint;
+  if (!S.tracking) hint = 'Tracking lost. Move slowly, more light helps.';
+  else if (S.cursor && S.unsteady) hint = 'Hold steady for a moment';
+  $('#ar-hint').textContent = hint;
   $('#ar-mode').textContent = m.name;
   $('#ar-units').textContent = settings.units === 'metric' ? 'cm' : 'ft';
   $('#ar-snap').setAttribute('aria-pressed', String(settings.snap));
+  $('#ar-lock').setAttribute('aria-pressed', String(S.lock));
+  $('#ar-surface').textContent = surfaceLabel();
   $('#ar-undo').disabled = !(S.pts.length || S.done.length > S.savedUpTo);
   const fin = $('#ar-finish');
   fin.hidden = !m.finishLabel;
@@ -361,14 +385,28 @@ export async function startAR(modeName, onEnd) {
   $('#ar-value').textContent = '--';
   $('#ar-sub').textContent = '';
   let session;
-  try {
-    // Must be the first await: Chrome only allows this inside the tap that opened it.
-    session = await navigator.xr.requestSession('immersive-ar', {
-      requiredFeatures: ['hit-test', 'dom-overlay'],
-      optionalFeatures: ['camera-access'],
-      domOverlay: { root },
-    });
-  } catch (err) { root.hidden = true; throw err; }
+  const base = { requiredFeatures: ['hit-test', 'dom-overlay'], domOverlay: { root } };
+  const attempts = [
+    // Full set: depth for any-surface hits, anchors to stop drift, planes for on-screen feedback.
+    {
+      ...base,
+      optionalFeatures: ['camera-access', 'anchors', 'plane-detection', 'depth-sensing'],
+      depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
+    },
+    { ...base, optionalFeatures: ['camera-access', 'anchors'] },
+  ];
+  let lastErr;
+  for (const opts of attempts) {
+    try {
+      // Must happen inside the tap that opened it, so nothing slow runs before this.
+      session = await navigator.xr.requestSession('immersive-ar', opts);
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (err.name === 'SecurityError') break; // camera refused: retrying won't help
+    }
+  }
+  if (!session) { root.hidden = true; throw lastErr; }
 
   try {
     const glCanvas = document.createElement('canvas');
@@ -376,13 +414,27 @@ export async function startAR(modeName, onEnd) {
     session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
     const ref = await session.requestReferenceSpace('local');
     const viewer = await session.requestReferenceSpace('viewer');
-    const hitSource = await session.requestHitTestSource({ space: viewer });
+    let hitSource;
+    try {
+      // Feature points let walls and objects register before ARCore has fitted a full plane to them.
+      hitSource = await session.requestHitTestSource({ space: viewer, entityTypes: ['plane', 'point'] });
+    } catch {
+      hitSource = await session.requestHitTestSource({ space: viewer });
+    }
     let binding = null;
     try { if (typeof XRWebGLBinding !== 'undefined') binding = new XRWebGLBinding(session, gl); } catch { /* no camera access */ }
+    const enabled = session.enabledFeatures || [];
     S = {
       mode: modeName, session, gl, ref, hitSource, binding, onEnd,
       pts: [], done: [], savedUpTo: 0, hit: null, hitNormal: [0, 1, 0], cursor: null,
-      camPos: [0, 0, 0], camDir: [0, 0, -1], proj: null, viewMat: null, tracking: false, wantPhoto: false,
+      camPos: [0, 0, 0], camDir: [0, 0, -1], proj: null, viewMat: null, worldFromView: null, tracking: false, wantPhoto: false,
+      // surface detection
+      src: null, smooth: null, recent: [], unsteady: false, planes: [], plane: null,
+      lock: modeName === 'area',
+      // If enabledFeatures isn't reported, try depth anyway; the first failed read turns it off.
+      hasDepth: enabled.length ? enabled.includes('depth-sensing') : true,
+      // anchors keep tapped points pinned while ARCore refines its map
+      pendingAnchors: [], anchored: [],
     };
     session.addEventListener('end', finishSession);
     session.addEventListener('select', doAdd);
@@ -418,29 +470,151 @@ function onFrame(t, frame) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
   const pose = frame.getViewerPose(s.ref);
-  if (!pose) { s.tracking = false; s.hit = null; s.cursor = null; refresh(); drawOverlay(); return; }
+  if (!pose) { s.tracking = false; s.hit = null; s.cursor = null; s.smooth = null; s.recent = []; refresh(); drawOverlay(); return; }
   s.tracking = true;
   const view = pose.views[0];
   s.proj = view.projectionMatrix;
   s.viewMat = view.transform.inverse.matrix;
+  s.worldFromView = view.transform.matrix;
   const o = view.transform.position;
   s.camPos = [o.x, o.y, o.z];
   s.camDir = norm(rotateByQuat([0, 0, -1], view.transform.orientation));
+
+  updateAnchors(frame);
+  updatePlanes(frame);
+  sense(frame, view);
+
+  s.cursor = mode().cursor(s);
+  refresh();
+  if (s.wantPhoto) { s.wantPhoto = false; capturePhoto(view); }
+  drawOverlay();
+}
+
+// ---------------------------------------------------------------- surface sensing
+// Combines three sources, best first:
+//   1. ARCore hit test (planes and feature points)
+//   2. Depth map at the crosshair (any textured surface, gives its own normal)
+//   3. The plane of the shape's first point (stable at grazing angles, works mid-air)
+function sense(frame, view) {
+  const s = S;
+  let hit = null, normal = null, src = null;
 
   const hits = frame.getHitTestResults(s.hitSource);
   if (hits.length) {
     const hp = hits[0].getPose(s.ref);
     if (hp) {
       const p = hp.transform.position;
-      s.hit = [p.x, p.y, p.z];
-      s.hitNormal = norm(rotateByQuat([0, 1, 0], hp.transform.orientation));
+      hit = [p.x, p.y, p.z];
+      normal = norm(rotateByQuat([0, 1, 0], hp.transform.orientation));
+      src = 'plane';
     }
-  } else s.hit = null;
+  }
 
-  s.cursor = mode().cursor(s);
-  refresh();
-  if (s.wantPhoto) { s.wantPhoto = false; capturePhoto(view); }
-  drawOverlay();
+  const dep = depthSample(frame, view);
+  if (dep) {
+    if (!hit) { hit = dep.p; normal = dep.n; src = 'depth'; }
+    else {
+      // A plane hit far behind what the depth map sees means ARCore extended a plane under an object
+      // (the floor under a table, say). Trust the nearer, real surface.
+      const dh = dist(s.camPos, hit), dd = dist(s.camPos, dep.p);
+      if (dd < dh * 0.88 - 0.03) { hit = dep.p; normal = dep.n; src = 'depth'; }
+    }
+  }
+
+  const lp = s.plane && s.pts.length ? s.plane : null;
+  if (lp) {
+    const onPlane = rayPlane(s.camPos, s.camDir, lp.p, lp.n);
+    const grazing = normal && Math.abs(dot(s.camDir, normal)) < 0.26; // within ~15° of skimming the surface
+    if (s.lock && onPlane) { hit = onPlane; normal = lp.n; src = 'lock'; }
+    else if (!hit && onPlane) { hit = onPlane; normal = lp.n; src = 'lock'; }
+    else if (hit && grazing && onPlane && distToPlane(hit, lp.p, lp.n) < 0.04) { hit = onPlane; normal = lp.n; src = 'lock'; }
+  }
+
+  if (!hit) { s.hit = null; s.src = null; s.smooth = null; s.recent = []; s.unsteady = false; return; }
+
+  // Damp hand shake: small moves are averaged, real jumps reset at once.
+  if (s.smooth && dist(s.smooth, hit) < 0.025) s.smooth = add(s.smooth, scale(sub(hit, s.smooth), 0.35));
+  else s.smooth = hit.slice();
+  s.recent.push(hit); if (s.recent.length > 15) s.recent.shift();
+  s.unsteady = s.recent.length >= 8 && spread(s.recent) > 0.012 && dist(s.camPos, hit) < 4;
+
+  // Normals point toward the camera so reticles and plane locks behave the same on either side.
+  if (dot(normal, sub(s.camPos, hit)) < 0) normal = scale(normal, -1);
+  s.hit = s.smooth;
+  s.hitNormal = normal;
+  s.src = src;
+}
+
+function depthSample(frame, view) {
+  const s = S;
+  if (!s.hasDepth || !frame.getDepthInformation) return null;
+  let info;
+  try { info = frame.getDepthInformation(view); } catch { s.hasDepth = false; return null; }
+  if (!info) return null;
+  const at = (x, y) => {
+    try {
+      const d = info.getDepthInMeters(x, y);
+      return d > 0.1 && d < 8 ? unproject(s.proj, s.worldFromView, x, y, d) : null;
+    } catch { return null; }
+  };
+  const c = at(0.5, 0.5);
+  if (!c) return null;
+  const e = 0.025;
+  const px = at(0.5 + e, 0.5), mx = at(0.5 - e, 0.5), py = at(0.5, 0.5 + e), my = at(0.5, 0.5 - e);
+  if (!px || !mx || !py || !my) return { p: c, n: norm(scale(s.camDir, -1)) };
+  const n = norm(cross(sub(px, mx), sub(py, my)));
+  return { p: c, n: n[0] || n[1] || n[2] ? n : norm(scale(s.camDir, -1)) };
+}
+
+function updateAnchors(frame) {
+  const s = S;
+  if (s.pendingAnchors.length && frame.createAnchor) {
+    const list = s.pendingAnchors.splice(0);
+    for (const p of list) {
+      try {
+        frame.createAnchor(new XRRigidTransform({ x: p[0], y: p[1], z: p[2] }), s.ref)
+          .then(a => { if (S === s) s.anchored.push({ p, a }); })
+          .catch(() => {});
+      } catch { /* anchors unsupported */ }
+    }
+  } else s.pendingAnchors.length = 0;
+  for (const { p, a } of s.anchored) {
+    const ap = frame.trackedAnchors && !frame.trackedAnchors.has(a) ? null : frame.getPose(a.anchorSpace, s.ref);
+    if (!ap) continue;
+    const q = ap.transform.position;
+    p[0] = q.x; p[1] = q.y; p[2] = q.z;
+  }
+}
+
+function updatePlanes(frame) {
+  const s = S;
+  s.planes = [];
+  const set = frame.detectedPlanes;
+  if (!set) return;
+  for (const pl of set) {
+    if (s.planes.length >= 24) break;
+    const pp = frame.getPose(pl.planeSpace, s.ref);
+    if (!pp || !pl.polygon || pl.polygon.length < 3) continue;
+    const m = pp.transform.matrix;
+    s.planes.push({
+      vertical: pl.orientation === 'vertical',
+      pts: pl.polygon.map(v => { const w = mulMat4(m, [v.x, v.y, v.z, 1]); return [w[0], w[1], w[2]]; }),
+    });
+  }
+}
+
+function surfaceLabel() {
+  const s = S;
+  if (!s.tracking) return '';
+  if (!s.hit) {
+    const nv = s.planes.filter(p => p.vertical).length, nh = s.planes.length - nv;
+    if (!s.planes.length) return 'Looking for surfaces…';
+    return `${nh} flat · ${nv} wall surface${nv === 1 ? '' : 's'} found`;
+  }
+  const tilt = Math.acos(Math.min(1, Math.abs(s.hitNormal[1]))) * 180 / Math.PI;
+  const kind = tilt < 8 ? (s.hit[1] < s.camPos[1] - 0.9 ? 'Floor' : 'Flat surface') : tilt > 82 ? 'Wall' : `Slope ${tilt.toFixed(0)}°`;
+  const how = { plane: '', depth: ' · depth', lock: ' · locked' }[s.src] || '';
+  return `${kind}${how} · ${fmtLen(dist(s.camPos, s.hit))} away`;
 }
 
 // ---------------------------------------------------------------- drawing
@@ -490,6 +664,19 @@ function drawScene(ctx, w, h, k, withReticle) {
     ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = 2 * k; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.stroke();
   };
 
+  // Detected surfaces: a faint wash so you can see what the phone has recognised.
+  if (withReticle) {
+    for (const pl of s.planes) {
+      const pts = pl.pts.map(proj);
+      if (pts.some(p => !p)) continue;
+      ctx.beginPath(); pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath();
+      ctx.fillStyle = pl.vertical ? 'rgba(120,190,255,.10)' : 'rgba(255,255,255,.08)'; ctx.fill();
+      ctx.setLineDash([3 * k, 5 * k]); ctx.lineWidth = 1.5 * k;
+      ctx.strokeStyle = pl.vertical ? 'rgba(120,190,255,.55)' : 'rgba(255,255,255,.45)'; ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
   const prims = mode().prims(s);
   const labels = [];
   for (const pr of prims) {
@@ -528,9 +715,17 @@ function drawScene(ctx, w, h, k, withReticle) {
       ring.push(proj(add(s.hit, add(scale(t1, Math.cos(a) * 0.04), scale(t2, Math.sin(a) * 0.04)))));
     }
     if (ring.every(Boolean)) {
+      // White: ARCore surface. Blue: depth map. Yellow dashed: locked to the first surface.
+      const col = s.src === 'lock' ? BLADE : s.src === 'depth' ? '#78beff' : '#fff';
       ctx.beginPath(); ring.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
       ctx.lineWidth = 4 * k; ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.stroke();
-      ctx.lineWidth = 2 * k; ctx.strokeStyle = '#fff'; ctx.stroke();
+      ctx.setLineDash(s.src === 'lock' ? [6 * k, 5 * k] : []);
+      ctx.lineWidth = (s.unsteady ? 1.5 : 2.5) * k; ctx.strokeStyle = col; ctx.stroke();
+      ctx.setLineDash([]);
+      // short stalk along the normal shows the surface's tilt
+      const tip = proj(add(s.hit, scale(n, 0.05)));
+      const base = proj(s.hit);
+      if (tip && base) { ctx.beginPath(); ctx.moveTo(base[0], base[1]); ctx.lineTo(tip[0], tip[1]); ctx.lineWidth = 2 * k; ctx.strokeStyle = col; ctx.stroke(); }
     }
   }
   if (withReticle && s.cursor) dot(s.cursor.p, 5, s.cursor.close ? '#7fe3a2' : BLADE);
