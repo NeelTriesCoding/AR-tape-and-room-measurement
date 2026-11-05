@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tapeline</title>
+<meta name="description" content="Free, ad-free AR tape measure, spirit level, screen ruler and home estimators.">
+<meta name="theme-color" content="#131411">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <button class="icon-btn" id="back" aria-label="Back" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+  </button>
+  <h1 id="title">Tapeline</h1>
+  <div class="unit-toggle" role="group" aria-label="Units">
+    <button id="u-metric" aria-pressed="true">cm</button>
+    <button id="u-imperial" aria-pressed="false">ft</button>
+  </div>
+</header>
+<main id="screen"></main>
+
+<div id="ar" hidden>
+  <canvas id="ar-canvas"></canvas>
+  <div class="ar-cross"></div>
+  <div class="ar-top">
+    <button class="ar-icon" id="ar-close" aria-label="Close camera">&times;</button>
+    <div class="ar-mode" id="ar-mode">Tape</div>
+    <button class="ar-chip" id="ar-units">cm</button>
+    <button class="ar-chip" id="ar-snap" aria-pressed="true">Snap</button>
+  </div>
+  <div class="ar-toast" id="ar-toast" hidden></div>
+  <div class="ar-bottom">
+    <div class="ar-readout"><div id="ar-value">--</div><div id="ar-sub"></div></div>
+    <div class="ar-hint" id="ar-hint">Move your phone slowly over the floor</div>
+    <div class="ar-controls">
+      <button id="ar-undo">Undo</button>
+      <button class="ar-add" id="ar-add" aria-label="Add point">+</button>
+      <button id="ar-finish">Done</button>
+    </div>
+    <div class="ar-controls secondary">
+      <button id="ar-photo">Photo</button>
+      <button id="ar-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
