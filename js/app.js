@@ -1,7 +1,7 @@
 import { settings, saveSettings, setUnits, onUnitsChange, num } from './units.js';
 import { $, $$, esc, toast, sheet, copyText, shareText, shareBlob, downloadBlob, sketchCanvas, canvasBlob, icons } from './ui.js';
 import { listEntries, updateEntry, removeEntry, clearEntries, getImage } from './store.js';
-import { arSupported, startAR } from './ar.js';
+import { arSupported, startAR, calibrationStatus } from './ar.js';
 import { level, protractor, ruler, converter, calibrateRuler } from './tools.js';
 import { paint, tiles, curtains, carpet } from './estimators.js';
 
@@ -85,6 +85,7 @@ function home() {
 
     <section class="group">
       <div class="group-head"><h2>Camera</h2><small>Chrome + ARCore phones</small></div>
+      ${calRow()}
       ${rows(AR_TOOLS, true)}
     </section>
     <section class="group">
@@ -105,12 +106,19 @@ function home() {
 
   $$('[data-go]').forEach(b => (b.onclick = () => { location.hash = b.dataset.go; }));
   $$('[data-ar]').forEach(b => (b.onclick = () => openAR(b.dataset.ar)));
+  $$('[data-cal]').forEach(b => (b.onclick = () => (arState === 'no' || !navigator.xr ? arHelp() : calibrationSheet())));
 }
 
-function openAR(mode) {
+let skippedCalThisVisit = false;
+
+function openAR(mode, opts) {
   if (arState === 'no' || !navigator.xr) { arHelp(); return; }
+  if (mode !== 'calibrate' && !calibrationStatus() && !skippedCalThisVisit) { calibrationPrompt(mode); return; }
   // startAR must run synchronously inside the tap, so no awaits before it.
-  startAR(mode, () => { if (!location.hash) home(); }).catch(err => {
+  startAR(mode, res => {
+    if (res?.calibrated) toast('Calibration saved. Every camera reading now uses it.', 3200);
+    if (!location.hash) home(); else if (location.hash === '#settings') route();
+  }, opts).catch(err => {
     console.warn(err);
     if (err && (err.name === 'NotSupportedError' || err.code === 'no-xr')) arHelp();
     else if (err && err.name === 'SecurityError') toast('Camera blocked. Allow camera for this site and try again.', 3500);
@@ -133,6 +141,80 @@ function arHelp() {
     </div>
     <p class="note" style="margin:0">On iPhone, Safari doesn't offer this. Apple's built-in Measure app does the same job. The level, ruler, converter and estimators here work on any phone.</p>
     <button class="btn ghost" data-close>OK</button>`);
+}
+
+// ------------------------------------------------------------- calibration
+const CAL_REFS = [
+  ['a4', 'A4 sheet, long edge', 0.297, 'Lay a sheet flat on the floor or a table. 29.7 cm.'],
+  ['tile', 'Floor tile edge, 2 ft', 0.6, 'One edge of a 600 × 600 mm tile. Check it with a tape first: some are 595 to 605 mm.'],
+  ['custom', 'Something I measured with a tape', null, 'A door width, table edge or bed. Longer is better: 60 cm to 2 m.'],
+];
+
+function calRow() {
+  const st = calibrationStatus();
+  const sub = st
+    ? `Calibrated ${new Date(st.when).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} on ${esc(st.ref)} · correction ${st.k >= 1 ? '+' : ''}${((st.k - 1) * 100).toFixed(1)}%`
+    : 'Not calibrated yet. Do this once, takes a minute.';
+  return `<div class="rows cal-row ${st ? '' : 'needs'}" style="margin-bottom:10px">
+    <button class="row" data-cal><span class="glyph">${icons.ruler}</span>
+      <span class="txt"><b>${st ? 'Calibration' : 'Calibrate camera first'}</b><span>${sub}</span></span>
+      <span class="chev">${icons.chev}</span></button></div>`;
+}
+
+function calibrationPrompt(mode) {
+  sheet(`
+    <h2>Calibrate once first</h2>
+    <p class="note" style="margin:0">Measuring something of known size lets Tapeline correct for your phone's camera. It takes about a minute and only needs doing once.</p>
+    <div class="btn-row"><button class="btn" id="cp-go">Calibrate now</button><button class="btn ghost" id="cp-skip">Skip for now</button></div>`,
+  (root, close) => {
+    $('#cp-go', root).onclick = () => { close(); calibrationSheet(); };
+    $('#cp-skip', root).onclick = () => { skippedCalThisVisit = true; close(); openAR(mode); };
+  });
+}
+
+function calibrationSheet() {
+  let pick = 'a4';
+  try { pick = localStorage.getItem('tl.calref') || 'a4'; } catch { /* default */ }
+  sheet(`
+    <h2>Calibrate camera</h2>
+    <p class="note" style="margin:0">You'll measure one known edge three times. If the readings agree, Tapeline works out a correction and applies it to every camera measurement.</p>
+    <div class="rows" id="cal-refs">${CAL_REFS.map(([k, name, , tip]) => `
+      <label class="row" style="cursor:pointer"><input type="radio" name="calref" value="${k}" ${k === pick ? 'checked' : ''} style="accent-color:var(--blade);width:20px;height:20px">
+        <span class="txt"><b>${name}</b><span>${tip}</span></span></label>`).join('')}</div>
+    <div class="field" id="cal-custom" hidden><label for="cal-len">Its real length</label>
+      <div class="input"><input id="cal-len" type="number" inputmode="decimal" step="any" min="1" placeholder="e.g. 90"><span class="suffix">cm</span></div></div>
+    <div class="card" style="padding:12px 14px"><b>For a good result</b>
+      <ul class="note" style="margin:6px 0 0;padding-left:18px">
+        <li>Good light, textured floor or table, not glossy tiles</li>
+        <li>Stand 50 cm to 1 m away, phone roughly above the edge</li>
+        <li>Tap exactly on the corners, take your time</li>
+      </ul></div>
+    <p class="note" id="cal-err" style="margin:0;color:var(--mark)" hidden></p>
+    <div class="btn-row"><button class="btn" id="cal-start">Start calibration</button><button class="btn ghost" data-close>Cancel</button>
+      ${calibrationStatus() ? '<button class="btn ghost" id="cal-reset">Remove calibration</button>' : ''}</div>`,
+  (root, close) => {
+    const sync = () => { pick = root.querySelector('[name=calref]:checked').value; $('#cal-custom', root).hidden = pick !== 'custom'; };
+    root.querySelectorAll('[name=calref]').forEach(r => (r.onchange = sync));
+    sync();
+    $('#cal-start', root).onclick = () => {
+      const ref = CAL_REFS.find(r => r[0] === pick);
+      let length = ref[2], label = { a4: 'A4 sheet', tile: 'floor tile' }[pick];
+      if (pick === 'custom') {
+        const cm = Number($('#cal-len', root).value);
+        if (!(cm >= 20 && cm <= 500)) { const e = $('#cal-err', root); e.hidden = false; e.textContent = 'Enter the real length in cm, between 20 and 500.'; return; }
+        length = cm / 100; label = `${cm} cm edge`;
+      }
+      try { localStorage.setItem('tl.calref', pick); } catch { /* ignore */ }
+      close();
+      openAR('calibrate', { calib: { length, label } });
+    };
+    const reset = $('#cal-reset', root);
+    if (reset) reset.onclick = () => {
+      if (!reset.dataset.armed) { reset.dataset.armed = '1'; reset.textContent = 'Tap again to remove'; reset.classList.add('danger'); return; }
+      delete settings.arScale; delete settings.arScaleAt; delete settings.arScaleRef; saveSettings();
+      close(); toast('Calibration removed'); route();
+    };
+  });
 }
 
 // ------------------------------------------------------------- history
@@ -217,6 +299,8 @@ function settingsView(el) {
         <h3>Units</h3>
         <div class="seg"><button data-units="metric" aria-pressed="${settings.units === 'metric'}">Metric (cm, m)</button><button data-units="imperial" aria-pressed="${settings.units === 'imperial'}">Feet & inches</button></div>
         <h3>Camera</h3>
+        <div class="btn-row"><button class="btn ghost" id="arcal">${calibrationStatus() ? 'Recalibrate camera' : 'Calibrate camera'}</button></div>
+        <p class="note" style="margin:0">${(st => st ? `Correction ${st.k >= 1 ? '+' : ''}${((st.k - 1) * 100).toFixed(1)}%, set ${new Date(st.when).toLocaleDateString('en-IN')} using ${esc(st.ref)}.` : 'Not calibrated. Camera readings use the phone\'s raw scale.')(calibrationStatus())}</p>
         <label class="check"><input type="checkbox" id="snap" ${settings.snap ? 'checked' : ''}> Snap lines to level and plumb when they're within a few degrees</label>
         <h3>Screen ruler</h3>
         <div class="btn-row"><button class="btn ghost" id="cal">${settings.ppmm ? 'Recalibrate' : 'Calibrate'} with a bank card</button></div>
@@ -228,6 +312,7 @@ function settingsView(el) {
     $$('[data-units]', el).forEach(b => (b.onclick = () => { setUnits(b.dataset.units); render(); }));
     $('#snap', el).onchange = e => { settings.snap = e.target.checked; saveSettings(); };
     $('#cal', el).onclick = () => calibrateRuler(render);
+    $('#arcal', el).onclick = () => (arState === 'no' || !navigator.xr ? arHelp() : calibrationSheet());
     $('#clear', el).onclick = e => {
       const b = e.target;
       if (b.dataset.armed) { clearEntries(); toast('History deleted'); render(); return; }

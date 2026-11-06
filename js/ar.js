@@ -6,8 +6,9 @@ import {
   inclination, rayPlane, distToPlane, unproject, spread,
 } from './geometry.js';
 import {
-  settings, saveSettings, setUnits, onUnitsChange,
-  fmtLen, fmtLenAlt, fmtArea, fmtAreaAlt, fmtVol, fmtVolAlt, fmtDeg,
+  settings, saveSettings, setUnits, onUnitsChange, fmtDeg,
+  fmtLen as rawLen, fmtLenAlt as rawLenAlt, fmtArea as rawArea, fmtAreaAlt as rawAreaAlt,
+  fmtVol as rawVol, fmtVolAlt as rawVolAlt,
 } from './units.js';
 import { $, toast, roundRect, canvasBlob } from './ui.js';
 import { addEntry, putImage } from './store.js';
@@ -15,6 +16,23 @@ import { addEntry, putImage } from './store.js';
 const NEAR = 0.05;
 const BLADE = '#f4c634';
 let S = null; // live session state
+
+// Scale correction from calibration. Lengths scale by k, areas by k², volumes by k³.
+// The calibration run itself always reads raw.
+const K = () => (S && S.mode === 'calibrate' ? 1 : settings.arScale || 1);
+const fmtLen = m => rawLen(m * K());
+const fmtLenAlt = m => rawLenAlt(m * K());
+const fmtArea = a => rawArea(a * K() ** 2);
+const fmtAreaAlt = a => rawAreaAlt(a * K() ** 2);
+const fmtVol = v => rawVol(v * K() ** 3);
+const fmtVolAlt = v => rawVolAlt(v * K() ** 3);
+const scaled = pts => pts.map(p => p.map(c => c * K())); // saved shapes carry corrected sizes
+
+export const CAL_LIMITS = { min: 0.85, max: 1.15, agree: 0.03 };
+export function calibrationStatus() {
+  if (!settings.arScale) return null;
+  return { k: settings.arScale, when: settings.arScaleAt, ref: settings.arScaleRef };
+}
 
 export async function arSupported() {
   try { return !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')); }
@@ -66,7 +84,7 @@ export const AR_MODES = {
     summary(items) {
       const lines = items.map((d, i) => `Line ${i + 1}: ${fmtLen(dist(d.a, d.b))} (${fmtLenAlt(dist(d.a, d.b))})${kindTag(d.kind) || slopeTag(d.a, d.b)}`);
       const value = items.length === 1 ? fmtLen(dist(items[0].a, items[0].b)) : `${items.length} lines`;
-      return { title: 'Tape', value, lines, data: { segments: items.map(d => [d.a, d.b]) } };
+      return { title: 'Tape', value, lines, data: { segments: items.map(d => scaled([d.a, d.b])) } };
     },
   },
 
@@ -100,7 +118,7 @@ export const AR_MODES = {
     },
     summary(items) {
       const lines = items.map((d, i) => `Height ${i + 1}: ${fmtLen(dist(d.a, d.b))} (${fmtLenAlt(dist(d.a, d.b))})`);
-      return { title: 'Height', value: items.length === 1 ? fmtLen(dist(items[0].a, items[0].b)) : `${items.length} heights`, lines, data: { segments: items.map(d => [d.a, d.b]) } };
+      return { title: 'Height', value: items.length === 1 ? fmtLen(dist(items[0].a, items[0].b)) : `${items.length} heights`, lines, data: { segments: items.map(d => scaled([d.a, d.b])) } };
     },
   },
 
@@ -149,7 +167,7 @@ export const AR_MODES = {
         return `Area ${i + 1}: ${fmtArea(area)} (${fmtAreaAlt(area)}), perimeter ${fmtLen(pathLength(d.pts, true))}`;
       });
       const total = items.reduce((t, d) => t + polygon(d.pts).area, 0);
-      return { title: 'Area', value: fmtArea(total), m2: total, lines, data: { polys: items.map(d => d.pts) } };
+      return { title: 'Area', value: fmtArea(total), m2: total * K() ** 2, lines, data: { polys: items.map(d => scaled(d.pts)) } };
     },
   },
 
@@ -233,7 +251,7 @@ export const AR_MODES = {
     },
     summary(items) {
       const lines = items.map((d, i) => `Path ${i + 1}: ${fmtLen(pathLength(d.pts))} (${fmtLenAlt(pathLength(d.pts))}), ${d.pts.length - 1} segments`);
-      return { title: 'Path', value: items.length === 1 ? fmtLen(pathLength(items[0].pts)) : `${items.length} paths`, lines, data: { paths: items.map(d => d.pts) } };
+      return { title: 'Path', value: items.length === 1 ? fmtLen(pathLength(items[0].pts)) : `${items.length} paths`, lines, data: { paths: items.map(d => scaled(d.pts)) } };
     },
   },
 
@@ -296,6 +314,66 @@ export const AR_MODES = {
 };
 const dims = d => ({ L: dist(d.p0, d.p1), W: dist(d.p1, d.p2), H: d.h });
 
+// ---------------------------------------------------------------- calibration
+// Measure a known length three times. Correction = known ÷ median reading,
+// accepted only if the three readings agree and the correction is plausible.
+export function evaluateCalibration(readings, known) {
+  if (readings.length < 3) return null;
+  const sorted = [...readings].sort((a, b) => a - b);
+  const median = sorted[1];
+  const disagreement = (sorted[2] - sorted[0]) / median;
+  const k = known / median;
+  let problem = null;
+  if (disagreement > CAL_LIMITS.agree) problem = `Readings differ by ${(disagreement * 100).toFixed(1)}%. Hold steadier and measure again.`;
+  else if (k < CAL_LIMITS.min || k > CAL_LIMITS.max) problem = `Readings are ${Math.abs((1 / k - 1) * 100).toFixed(0)}% off the known length. Check the length you entered, or retry in better light.`;
+  return { k, median, disagreement, problem };
+}
+
+AR_MODES.calibrate = {
+  name: 'Calibrate',
+  cursor: snapped,
+  add(s, c) {
+    if (s.done.length >= 3) { toast('Three readings taken. Apply or Retry.'); return; }
+    if (!s.pts.length) s.pts = [c.p];
+    else { s.done.push({ a: s.pts[0], b: c.p, kind: c.kind }); s.pts = []; }
+  },
+  finishLabel: s => (calResult(s)?.problem ? 'Retry' : 'Apply'),
+  canFinish: s => s.done.length >= 3,
+  finish(s) {
+    const r = calResult(s);
+    if (!r) return;
+    if (r.problem) { s.done = []; s.pts = []; toast('Cleared. Measure the edge 3 times again.'); return; }
+    settings.arScale = Math.round(r.k * 10000) / 10000;
+    settings.arScaleAt = Date.now();
+    settings.arScaleRef = s.calib.label;
+    saveSettings();
+    s.calibrated = true;
+    toast(`Calibrated. Correction ${r.k >= 1 ? '+' : ''}${((r.k - 1) * 100).toFixed(1)}%`);
+    setTimeout(() => s.session.end().catch(() => {}), 900);
+  },
+  readout(s) {
+    const known = s.calib.length;
+    const n = s.done.length;
+    const r = calResult(s);
+    if (r) {
+      return {
+        value: r.problem ? 'Try again' : `${r.k >= 1 ? '+' : ''}${((r.k - 1) * 100).toFixed(1)}%`,
+        sub: `Readings ${s.done.map(d => rawLen(dist(d.a, d.b))).join(', ')} · actual ${rawLen(known)}`,
+        hint: r.problem || 'Readings agree. Tap Apply to save the correction.',
+      };
+    }
+    if (s.pts.length && s.cursor) {
+      const L = dist(s.pts[0], s.cursor.p);
+      return { value: rawLen(L), sub: `Reading ${n + 1} of 3 · actual ${rawLen(known)}`, hint: 'Aim at the other end of the edge, tap +' };
+    }
+    const hint = s.cursor ? `Reading ${n + 1} of 3: aim at one end of the ${s.calib.label}, tap +` : noSurface;
+    return { value: n ? rawLen(dist(s.done[n - 1].a, s.done[n - 1].b)) : '--', sub: `${n} of 3 readings · actual ${rawLen(known)}`, hint };
+  },
+  prims: s => AR_MODES.tape.prims(s),
+  summary: () => null,
+};
+const calResult = s => evaluateCalibration(s.done.map(d => dist(d.a, d.b)), s.calib.length);
+
 // ---------------------------------------------------------------- session
 let wired = false;
 function wireUI() {
@@ -321,6 +399,12 @@ function wireUI() {
     toast(S.lock ? 'Points stay on the first surface you tap' : 'Points follow whatever you aim at');
     refresh();
   });
+  $('#warm-skip').addEventListener('click', () => {
+    if (!S) return;
+    S.warm.ready = true;
+    toast('Scan skipped. Readings may be less accurate.', 3000);
+    refresh();
+  });
   onUnitsChange(() => refresh());
 }
 
@@ -329,6 +413,7 @@ const buzz = () => { try { navigator.vibrate?.(12); } catch { /* not allowed */ 
 
 function doAdd() {
   if (!S) return;
+  if (!S.warm.ready) { toast('Finish the scan first: move the phone slowly side to side'); return; }
   const c = S.cursor;
   if (!c) { toast('No surface yet. Move the phone slowly.'); return; }
   const starting = S.pts.length === 0;
@@ -348,6 +433,7 @@ function refresh() {
   $('#ar-sub').textContent = r.sub;
   let hint = r.hint;
   if (!S.tracking) hint = 'Tracking lost. Move slowly, more light helps.';
+  else if (!S.warm.ready) hint = 'Scan the area first';
   else if (S.cursor && S.unsteady) hint = 'Hold steady for a moment';
   $('#ar-hint').textContent = hint;
   $('#ar-mode').textContent = m.name;
@@ -357,13 +443,72 @@ function refresh() {
   $('#ar-surface').textContent = surfaceLabel();
   $('#ar-undo').disabled = !(S.pts.length || S.done.length > S.savedUpTo);
   const fin = $('#ar-finish');
-  fin.hidden = !m.finishLabel;
-  if (m.finishLabel) { fin.textContent = m.finishLabel; fin.disabled = !m.canFinish(S); }
+  const fl = typeof m.finishLabel === 'function' ? m.finishLabel(S) : m.finishLabel;
+  fin.hidden = !fl;
+  if (fl) { fin.textContent = fl; fin.disabled = !m.canFinish(S); }
+  const calibrating = S.mode === 'calibrate';
+  $('#ar-save').hidden = calibrating;
+  $('#ar-photo').hidden = calibrating;
   $('#ar-save').disabled = S.done.length <= S.savedUpTo;
+  renderWarm();
+}
+
+// ---------------------------------------------------------------- scan gate
+// Nothing can be measured until ARCore has a stable map: tracking for a few seconds,
+// some sideways movement for parallax, a real surface under the crosshair, and a steady reticle.
+const WARM = { seconds: 2.5, move: 0.35, surfaceFrames: 20, steadyFrames: 20, skipAfter: 15 };
+const newWarm = (move = WARM.move) => ({ ready: false, t0: performance.now(), moved: 0, lastPos: null, surface: 0, steady: 0, lost: 0, need: move });
+
+function updateWarm() {
+  const s = S, w = s.warm;
+  if (!s.tracking) {
+    w.lost++;
+    // Lost for about a second: the map may have jumped, so rescan before trusting new points.
+    if (w.ready && w.lost > 30) { s.warm = newWarm(0.15); s.pts = []; toast('Tracking was lost. Scan again before measuring.', 3000); }
+    return;
+  }
+  w.lost = 0;
+  if (w.ready) return;
+  if (w.lastPos) { const d = dist(w.lastPos, s.camPos); if (d < 0.1) w.moved += d; }
+  w.lastPos = s.camPos.slice();
+  w.surface = s.src === 'plane' || (s.planes.length && s.hit) ? w.surface + 1 : Math.max(0, w.surface - 2);
+  w.steady = s.hit && s.recent.length >= 8 && spread(s.recent) < 0.008 ? w.steady + 1 : 0;
+  const checks = warmChecks();
+  if (checks.every(c => c.done)) { w.ready = true; buzz(); setTimeout(buzz, 120); toast('Ready to measure'); }
+}
+
+function warmChecks() {
+  const w = S.warm;
+  const secs = (performance.now() - w.t0) / 1000;
+  return [
+    { label: 'Tracking', done: S.tracking && secs >= WARM.seconds, p: Math.min(1, secs / WARM.seconds) },
+    { label: 'Moved side to side', done: w.moved >= w.need, p: Math.min(1, w.moved / w.need) },
+    { label: 'Surface found', done: w.surface >= WARM.surfaceFrames, p: Math.min(1, w.surface / WARM.surfaceFrames) },
+    { label: 'Steady', done: w.steady >= WARM.steadyFrames, p: Math.min(1, w.steady / WARM.steadyFrames) },
+  ];
+}
+
+function renderWarm() {
+  const panel = $('#ar-warm');
+  const ready = S.warm.ready;
+  panel.hidden = ready;
+  $('#ar-add').disabled = !ready;
+  if (ready) return;
+  const checks = warmChecks();
+  const p = checks.reduce((t, c) => t + c.p, 0) / checks.length;
+  $('#warm-bar').style.width = `${Math.round(p * 100)}%`;
+  $('#warm-list').innerHTML = checks.map(c => `<li class="${c.done ? 'done' : ''}">${c.done ? '✓' : '○'} ${c.label}</li>`).join('');
+  const next = checks.find(c => !c.done);
+  $('#warm-tip').textContent = !next ? '' :
+    next.label === 'Moved side to side' ? 'Sweep the phone slowly left and right over the area' :
+    next.label === 'Surface found' ? 'Point at a textured floor or table, about 1 m away' :
+    next.label === 'Steady' ? 'Hold still with the crosshair on the surface' : 'Starting the camera…';
+  const secs = (performance.now() - S.warm.t0) / 1000;
+  $('#warm-skip').hidden = secs < WARM.skipAfter || S.mode === 'calibrate';
 }
 
 function save() {
-  if (!S) return null;
+  if (!S || S.mode === 'calibrate') return null;
   const items = S.done.slice(S.savedUpTo);
   if (!items.length) return null;
   const sum = mode().summary(items);
@@ -375,7 +520,7 @@ function save() {
   } catch { toast('Could not save. Phone storage may be full.'); return null; }
 }
 
-export async function startAR(modeName, onEnd) {
+export async function startAR(modeName, onEnd, opts = {}) {
   wireUI();
   if (S) return;
   if (!navigator.xr) throw Object.assign(new Error('no-xr'), { code: 'no-xr' });
@@ -435,6 +580,8 @@ export async function startAR(modeName, onEnd) {
       hasDepth: enabled.length ? enabled.includes('depth-sensing') : true,
       // anchors keep tapped points pinned while ARCore refines its map
       pendingAnchors: [], anchored: [],
+      warm: newWarm(),
+      calib: opts.calib || null, calibrated: false,
     };
     session.addEventListener('end', finishSession);
     session.addEventListener('select', doAdd);
@@ -453,10 +600,11 @@ function finishSession() {
   if (S.done.length > S.savedUpTo) autoSaved = !!save();
   try { S.hitSource.cancel(); } catch { /* already gone */ }
   const cb = S.onEnd;
+  const result = { mode: S.mode, calibrated: S.calibrated };
   S = null;
   $('#ar').hidden = true;
   if (autoSaved) toast('Measurements saved to History');
-  cb?.();
+  cb?.(result);
 }
 
 function onFrame(t, frame) {
@@ -470,7 +618,7 @@ function onFrame(t, frame) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
   const pose = frame.getViewerPose(s.ref);
-  if (!pose) { s.tracking = false; s.hit = null; s.cursor = null; s.smooth = null; s.recent = []; refresh(); drawOverlay(); return; }
+  if (!pose) { s.tracking = false; s.hit = null; s.cursor = null; s.smooth = null; s.recent = []; updateWarm(); refresh(); drawOverlay(); return; }
   s.tracking = true;
   const view = pose.views[0];
   s.proj = view.projectionMatrix;
@@ -483,6 +631,7 @@ function onFrame(t, frame) {
   updateAnchors(frame);
   updatePlanes(frame);
   sense(frame, view);
+  updateWarm();
 
   s.cursor = mode().cursor(s);
   refresh();

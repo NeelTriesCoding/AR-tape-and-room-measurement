@@ -1,6 +1,6 @@
 // Offline support. App files: network first so updates show up at once, cache when offline.
 // Fonts: cache first, they never change.
-const CACHE = 'tapeline-v2';
+const CACHE = 'tapeline-v3';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/ar.js', 'js/tools.js', 'js/estimators.js', 'js/ui.js', 'js/units.js', 'js/store.js', 'js/geometry.js',
